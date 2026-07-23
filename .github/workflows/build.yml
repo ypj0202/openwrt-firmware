@@ -9,15 +9,95 @@ on:
 permissions:
   contents: write
 
-env:
-  OPENWRT_VERSION: "25.12.4"
-  OPENWRT_BRANCH: "v25.12.4"
-
 jobs:
+  detect-version:
+    name: Detect latest stable OpenWrt
+    runs-on: ubuntu-24.04
+
+    outputs:
+      version: ${{ steps.openwrt.outputs.version }}
+      tag: ${{ steps.openwrt.outputs.tag }}
+
+    steps:
+      - name: Resolve latest stable release
+        id: openwrt
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          RELEASES="$(
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              --location \
+              --retry 5 \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/openwrt/openwrt/releases?per_page=100"
+          )"
+
+          VERSION="$(
+            printf '%s' "${RELEASES}" |
+              python3 -c '
+          import json
+          import re
+          import sys
+
+          releases = json.load(sys.stdin)
+          versions = []
+
+          for release in releases:
+              if release.get("draft") or release.get("prerelease"):
+                  continue
+
+              tag = release.get("tag_name", "")
+              match = re.fullmatch(r"v?(\d+\.\d+\.\d+)", tag)
+
+              if match:
+                  version = match.group(1)
+                  versions.append(tuple(map(int, version.split("."))))
+
+          if not versions:
+              raise SystemExit("No stable OpenWrt x.y.z release was found")
+
+          print(".".join(map(str, max(versions))))
+          '
+          )"
+
+          TAG="v${VERSION}"
+
+          echo "Latest stable OpenWrt version: ${VERSION}"
+          echo "OpenWrt source tag: ${TAG}"
+
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify source tag exists
+        shell: bash
+        env:
+          OPENWRT_TAG: ${{ steps.openwrt.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          git ls-remote \
+            --exit-code \
+            --refs \
+            https://github.com/openwrt/openwrt.git \
+            "refs/tags/${OPENWRT_TAG}"
+
   build:
     name: Build ${{ matrix.device_name }}
+    needs: detect-version
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+
+    env:
+      OPENWRT_VERSION: ${{ needs.detect-version.outputs.version }}
+      OPENWRT_TAG: ${{ needs.detect-version.outputs.tag }}
 
     strategy:
       fail-fast: false
@@ -35,12 +115,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Free disk space
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
           sudo rm -rf /usr/local/lib/android || true
           sudo rm -rf /usr/share/dotnet || true
@@ -52,10 +132,9 @@ jobs:
       - name: Install build dependencies
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
           sudo apt-get update
-
           sudo apt-get install -y \
             ack \
             antlr3 \
@@ -131,11 +210,13 @@ jobs:
       - name: Clone OpenWrt source
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
+
+          echo "Building OpenWrt ${OPENWRT_VERSION} from ${OPENWRT_TAG}"
 
           git clone \
             --depth 1 \
-            --branch "${OPENWRT_BRANCH}" \
+            --branch "${OPENWRT_TAG}" \
             https://github.com/openwrt/openwrt.git \
             openwrt
 
@@ -143,17 +224,15 @@ jobs:
         working-directory: openwrt
         shell: bash
         run: |
-          set -euxo pipefail
-
+          set -euo pipefail
           ./scripts/feeds update -a
 
-      - name: Replace Go package feed
+      - name: Replace Go package feed for NetBird
         working-directory: openwrt
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
-          # The NetBird OpenWrt package uses a newer Go toolchain.
           rm -rf feeds/packages/lang/golang
 
           git clone \
@@ -165,11 +244,10 @@ jobs:
       - name: Add Argon packages
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
           mkdir -p openwrt/package/custom
 
-          # Clone the actual OpenWrt packages, not the autobuild repository.
           git clone \
             --depth 1 \
             https://github.com/jerrykuku/luci-theme-argon.git \
@@ -180,12 +258,12 @@ jobs:
             https://github.com/jerrykuku/luci-app-argon-config.git \
             openwrt/package/custom/luci-app-argon-config
 
-          # Match the dependency adjustment used by the Argon autobuild.
-          if grep -q "LUCI_DEPENDS:=+wget" \
-            openwrt/package/custom/luci-theme-argon/Makefile; then
+          THEME_MAKEFILE="openwrt/package/custom/luci-theme-argon/Makefile"
+
+          if grep -q 'LUCI_DEPENDS:=+wget' "${THEME_MAKEFILE}"; then
             sed -i \
-              "s/LUCI_DEPENDS:=+wget/LUCI_DEPENDS:=+wget-ssl/" \
-              openwrt/package/custom/luci-theme-argon/Makefile
+              's/LUCI_DEPENDS:=+wget/LUCI_DEPENDS:=+wget-ssl/' \
+              "${THEME_MAKEFILE}"
           fi
 
           rm -rf \
@@ -195,17 +273,14 @@ jobs:
       - name: Add NetBird package
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
           git clone \
             --depth 1 \
             https://github.com/ypj0202/netbird-openwrt-autobuild.git \
             /tmp/netbird-openwrt-autobuild
 
-          if [[ ! -f /tmp/netbird-openwrt-autobuild/netbird/Makefile ]]; then
-            echo "NetBird OpenWrt package Makefile was not found."
-            exit 1
-          fi
+          test -f /tmp/netbird-openwrt-autobuild/netbird/Makefile
 
           cp -a \
             /tmp/netbird-openwrt-autobuild/netbird \
@@ -219,30 +294,29 @@ jobs:
         working-directory: openwrt
         shell: bash
         run: |
-          set -euxo pipefail
-
+          set -euo pipefail
           ./scripts/feeds install -a
 
-      - name: Verify custom package definitions
+      - name: Verify device profile exists
+        working-directory: openwrt
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
-          test -f openwrt/package/custom/luci-theme-argon/Makefile
-          test -f openwrt/package/custom/luci-app-argon-config/Makefile
-          test -f openwrt/package/custom/netbird/Makefile
+          PROFILE_SYMBOL="TARGET_ramips_mt7621_DEVICE_${{ matrix.profile }}"
 
-          echo "Custom package definitions:"
-          find openwrt/package/custom \
-            -maxdepth 2 \
-            -name Makefile \
-            -print
+          if ! grep -Rqs \
+            "config ${PROFILE_SYMBOL}" \
+            target/linux/ramips/image; then
+            echo "Device profile not found: ${PROFILE_SYMBOL}"
+            exit 1
+          fi
 
       - name: Generate OpenWrt configuration
         working-directory: openwrt
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
           cat > .config <<EOF
           CONFIG_TARGET_ramips=y
@@ -251,8 +325,6 @@ jobs:
 
           CONFIG_PACKAGE_luci=y
           CONFIG_PACKAGE_luci-ssl=y
-          CONFIG_PACKAGE_luci-app-firewall=y
-          CONFIG_PACKAGE_luci-app-opkg=y
 
           CONFIG_PACKAGE_luci-theme-argon=y
           CONFIG_PACKAGE_luci-app-argon-config=y
@@ -267,7 +339,6 @@ jobs:
           CONFIG_PACKAGE_curl=y
           CONFIG_PACKAGE_wget-ssl=y
 
-          CONFIG_DEVEL=y
           CONFIG_CCACHE=y
           EOF
 
@@ -277,7 +348,7 @@ jobs:
         working-directory: openwrt
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
           REQUIRED_OPTIONS=(
             "CONFIG_TARGET_ramips=y"
@@ -289,37 +360,26 @@ jobs:
           )
 
           for option in "${REQUIRED_OPTIONS[@]}"; do
-            if ! grep -Fqx "$option" .config; then
-              echo "Required configuration option is missing:"
-              echo "$option"
+            if ! grep -Fqx "${option}" .config; then
+              echo "Required configuration option is missing: ${option}"
               exit 1
             fi
           done
 
-          echo "Selected device:"
           grep -E \
-            "^CONFIG_TARGET_ramips_mt7621_DEVICE_.*=y$" \
+            '^CONFIG_TARGET_ramips_mt7621_DEVICE_.*=y$|^CONFIG_PACKAGE_(luci-theme-argon|luci-app-argon-config|netbird)=y$' \
             .config
 
-          echo "Selected custom packages:"
-          grep -E \
-            "^CONFIG_PACKAGE_(luci-theme-argon|luci-app-argon-config|netbird)=y$" \
-            .config
-
-      - name: Download source packages
+      - name: Download package sources
         working-directory: openwrt
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
           make download -j"$(nproc)" V=s
 
-          # Remove incomplete or failed downloads.
-          find dl \
-            -type f \
-            -size -1024c \
-            -print \
-            -delete || true
+          # Delete suspiciously small/incomplete downloads.
+          find dl -type f -size -1024c -print -delete || true
 
       - name: Build firmware
         working-directory: openwrt
@@ -327,35 +387,31 @@ jobs:
         run: |
           set -o pipefail
 
-          BUILD_JOBS="$(nproc)"
+          JOBS="$(nproc)"
 
-          echo "Starting build with ${BUILD_JOBS} parallel jobs."
-
-          if ! make -j"${BUILD_JOBS}" V=s 2>&1 | tee build.log; then
-            echo "Parallel build failed."
-            echo "Retrying with one build job for clearer diagnostics."
-
+          if ! make -j"${JOBS}" V=s 2>&1 | tee build.log; then
+            echo "Parallel build failed; retrying serially for diagnostics."
             make -j1 V=sc 2>&1 | tee -a build.log
           fi
 
-      - name: Locate generated manifest
+      - name: Find and verify firmware manifest
         id: manifest
         working-directory: openwrt
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
-          TARGET_DIRECTORY="bin/targets/ramips/mt7621"
+          TARGET_DIR="bin/targets/ramips/mt7621"
 
           echo "Generated target files:"
-          find "$TARGET_DIRECTORY" \
+          find "${TARGET_DIR}" \
             -maxdepth 1 \
             -type f \
-            -printf "%f\n" \
+            -printf '%f\n' \
             | sort
 
-          MANIFEST_PATH="$(
-            find "$TARGET_DIRECTORY" \
+          MANIFEST="$(
+            find "${TARGET_DIR}" \
               -maxdepth 1 \
               -type f \
               -name "*${{ matrix.firmware_pattern }}*.manifest" \
@@ -363,24 +419,10 @@ jobs:
               | head -n 1
           )"
 
-          if [[ -z "$MANIFEST_PATH" ]]; then
+          if [[ -z "${MANIFEST}" ]]; then
             echo "No manifest found for ${{ matrix.device_name }}."
             exit 1
           fi
-
-          echo "manifest_path=$MANIFEST_PATH" >> "$GITHUB_OUTPUT"
-          echo "Found manifest: $MANIFEST_PATH"
-
-      - name: Verify packages are inside firmware
-        working-directory: openwrt
-        shell: bash
-        env:
-          MANIFEST_PATH: ${{ steps.manifest.outputs.manifest_path }}
-        run: |
-          set -euxo pipefail
-
-          echo "Checking firmware manifest:"
-          cat "$MANIFEST_PATH"
 
           REQUIRED_PACKAGES=(
             "luci-theme-argon"
@@ -389,27 +431,25 @@ jobs:
           )
 
           for package in "${REQUIRED_PACKAGES[@]}"; do
-            if ! grep -Eq "^${package}[[:space:]]" "$MANIFEST_PATH"; then
-              echo "Required package is missing from firmware:"
-              echo "$package"
+            if ! grep -Eq "^${package}[[:space:]]" "${MANIFEST}"; then
+              echo "Package missing from firmware manifest: ${package}"
               exit 1
             fi
           done
 
-          echo "All required packages are included."
+          echo "manifest=${MANIFEST}" >> "${GITHUB_OUTPUT}"
 
       - name: Collect firmware files
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
-          SOURCE_DIRECTORY="openwrt/bin/targets/ramips/mt7621"
-          OUTPUT_DIRECTORY="out/${{ matrix.artifact_name }}"
+          SOURCE_DIR="openwrt/bin/targets/ramips/mt7621"
+          OUTPUT_DIR="out/${{ matrix.artifact_name }}"
 
-          mkdir -p "$OUTPUT_DIRECTORY"
+          mkdir -p "${OUTPUT_DIR}"
 
-          # Collect only files belonging to this device.
-          find "$SOURCE_DIRECTORY" \
+          find "${SOURCE_DIR}" \
             -maxdepth 1 \
             -type f \
             \( \
@@ -417,52 +457,48 @@ jobs:
               -name "*${{ matrix.firmware_pattern }}*.itb" -o \
               -name "*${{ matrix.firmware_pattern }}*.manifest" \
             \) \
-            -exec cp -v {} "$OUTPUT_DIRECTORY/" \;
+            -exec cp -v {} "${OUTPUT_DIR}/" \;
 
-          # Collect common build metadata.
-          for metadata_file in \
+          for metadata in \
             config.buildinfo \
             feeds.buildinfo \
             version.buildinfo \
             sha256sums; do
-            if [[ -f "$SOURCE_DIRECTORY/$metadata_file" ]]; then
+            if [[ -f "${SOURCE_DIR}/${metadata}" ]]; then
               cp -v \
-                "$SOURCE_DIRECTORY/$metadata_file" \
-                "$OUTPUT_DIRECTORY/${{ matrix.artifact_name }}-${metadata_file}"
+                "${SOURCE_DIR}/${metadata}" \
+                "${OUTPUT_DIR}/${{ matrix.artifact_name }}-${metadata}"
             fi
           done
 
           cp \
             openwrt/.config \
-            "$OUTPUT_DIRECTORY/${{ matrix.artifact_name }}-build.config"
+            "${OUTPUT_DIR}/${{ matrix.artifact_name }}-build.config"
 
           cp \
             openwrt/build.log \
-            "$OUTPUT_DIRECTORY/${{ matrix.artifact_name }}-build.log"
+            "${OUTPUT_DIR}/${{ matrix.artifact_name }}-build.log"
 
           echo "Collected files:"
-          find "$OUTPUT_DIRECTORY" \
+          find "${OUTPUT_DIR}" \
             -maxdepth 1 \
             -type f \
-            -printf "%f\n" \
+            -printf '%f\n' \
             | sort
 
-          FIRMWARE_FILE="$(
-            find "$OUTPUT_DIRECTORY" \
-              -maxdepth 1 \
-              -type f \
-              \( -name "*.bin" -o -name "*.itb" \) \
-              -print \
-              | head -n 1
-          )"
-
-          if [[ -z "$FIRMWARE_FILE" ]]; then
+          if ! find "${OUTPUT_DIR}" \
+            -maxdepth 1 \
+            -type f \
+            \( -name '*.bin' -o -name '*.itb' \) \
+            -print \
+            -quit |
+            grep -q .; then
             echo "No firmware image was collected."
             exit 1
           fi
 
       - name: Upload firmware artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: firmware-${{ matrix.artifact_name }}
           path: out/${{ matrix.artifact_name }}/
@@ -472,42 +508,46 @@ jobs:
 
   release:
     name: Publish monthly release
+    needs:
+      - detect-version
+      - build
     runs-on: ubuntu-24.04
-    needs: build
+
+    env:
+      OPENWRT_VERSION: ${{ needs.detect-version.outputs.version }}
+      OPENWRT_TAG: ${{ needs.detect-version.outputs.tag }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Download firmware artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: firmware-*
           path: release-assets
           merge-multiple: true
 
-      - name: List release files
+      - name: Verify release files
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
+          echo "Release files:"
           find release-assets \
             -maxdepth 1 \
             -type f \
-            -printf "%f\n" \
+            -printf '%f\n' \
             | sort
 
           FIRMWARE_COUNT="$(
             find release-assets \
               -maxdepth 1 \
               -type f \
-              \( -name "*.bin" -o -name "*.itb" \) \
+              \( -name '*.bin' -o -name '*.itb' \) \
               | wc -l
           )"
 
-          if [[ "$FIRMWARE_COUNT" -lt 2 ]]; then
-            echo "Expected firmware for two devices."
-            echo "Found only ${FIRMWARE_COUNT} firmware image files."
+          if [[ "${FIRMWARE_COUNT}" -lt 2 ]]; then
+            echo "Expected firmware images for both devices."
+            echo "Found ${FIRMWARE_COUNT} image file(s)."
             exit 1
           fi
 
@@ -515,14 +555,18 @@ jobs:
         id: release
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
           RELEASE_TAG="monthly-$(date -u +'%Y-%m')"
 
-          echo "tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "tag=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
 
           cat > release-notes.md <<EOF
           Automated OpenWrt ${OPENWRT_VERSION} firmware build.
+
+          OpenWrt source tag:
+
+          - ${OPENWRT_TAG}
 
           Included custom packages:
 
@@ -535,28 +579,28 @@ jobs:
           - Xiaomi Mi Router CR6608
           - Xiaomi Redmi Router AC2100
 
-          The build manifests are included in the release and can be used to
-          verify that the custom packages are present in each firmware image.
+          Each device manifest is included so the embedded packages can be verified.
           EOF
 
-      - name: Delete existing monthly release
+      - name: Delete existing release for this month
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
             gh release delete \
-              "$RELEASE_TAG" \
+              "${RELEASE_TAG}" \
               --yes \
               --cleanup-tag
           fi
 
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
+          token: ${{ github.token }}
           tag_name: ${{ steps.release.outputs.tag }}
           name: OpenWrt monthly build ${{ steps.release.outputs.tag }}
           body_path: release-notes.md
