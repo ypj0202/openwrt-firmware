@@ -1,0 +1,571 @@
+name: Monthly OpenWrt Firmware Build
+
+on:
+  workflow_dispatch:
+  schedule:
+    # First day of every month at 00:00 UTC
+    - cron: "0 0 1 * *"
+
+permissions:
+  contents: write
+
+env:
+  OPENWRT_VERSION: "25.12.4"
+  OPENWRT_BRANCH: "v25.12.4"
+
+jobs:
+  build:
+    name: Build ${{ matrix.device_name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - device_name: Xiaomi Mi Router CR6608
+            profile: xiaomi_mi-router-cr6608
+            firmware_pattern: xiaomi_mi-router-cr6608
+            artifact_name: xiaomi-mi-router-cr6608
+
+          - device_name: Xiaomi Redmi Router AC2100
+            profile: xiaomi_redmi-router-ac2100
+            firmware_pattern: xiaomi_redmi-router-ac2100
+            artifact_name: xiaomi-redmi-router-ac2100
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+
+          df -h
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            ack \
+            antlr3 \
+            asciidoc \
+            autoconf \
+            automake \
+            autopoint \
+            binutils \
+            bison \
+            build-essential \
+            bzip2 \
+            ccache \
+            clang \
+            cmake \
+            cpio \
+            curl \
+            device-tree-compiler \
+            fastjar \
+            flex \
+            g++ \
+            g++-multilib \
+            gawk \
+            gcc \
+            gcc-multilib \
+            gettext \
+            git \
+            gperf \
+            haveged \
+            help2man \
+            intltool \
+            libc6-dev-i386 \
+            libelf-dev \
+            libglib2.0-dev \
+            libgmp3-dev \
+            libltdl-dev \
+            libmpc-dev \
+            libmpfr-dev \
+            libncurses5-dev \
+            libncursesw5-dev \
+            libpython3-dev \
+            libreadline-dev \
+            libssl-dev \
+            libtool \
+            lrzsz \
+            mkisofs \
+            msmtp \
+            nano \
+            ninja-build \
+            npm \
+            p7zip \
+            p7zip-full \
+            patch \
+            pkgconf \
+            python3 \
+            python3-pyelftools \
+            python3-setuptools \
+            qemu-utils \
+            rsync \
+            scons \
+            squashfs-tools \
+            subversion \
+            swig \
+            texinfo \
+            uglifyjs \
+            unzip \
+            upx-ucl \
+            vim \
+            wget \
+            xmlto \
+            xxd \
+            zlib1g-dev
+
+      - name: Clone OpenWrt source
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          git clone \
+            --depth 1 \
+            --branch "${OPENWRT_BRANCH}" \
+            https://github.com/openwrt/openwrt.git \
+            openwrt
+
+      - name: Update OpenWrt feeds
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          ./scripts/feeds update -a
+
+      - name: Replace Go package feed
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          # The NetBird OpenWrt package uses a newer Go toolchain.
+          rm -rf feeds/packages/lang/golang
+
+          git clone \
+            --depth 1 \
+            --branch 26.x \
+            https://github.com/sbwml/packages_lang_golang.git \
+            feeds/packages/lang/golang
+
+      - name: Add Argon packages
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p openwrt/package/custom
+
+          # Clone the actual OpenWrt packages, not the autobuild repository.
+          git clone \
+            --depth 1 \
+            https://github.com/jerrykuku/luci-theme-argon.git \
+            openwrt/package/custom/luci-theme-argon
+
+          git clone \
+            --depth 1 \
+            https://github.com/jerrykuku/luci-app-argon-config.git \
+            openwrt/package/custom/luci-app-argon-config
+
+          # Match the dependency adjustment used by the Argon autobuild.
+          if grep -q "LUCI_DEPENDS:=+wget" \
+            openwrt/package/custom/luci-theme-argon/Makefile; then
+            sed -i \
+              "s/LUCI_DEPENDS:=+wget/LUCI_DEPENDS:=+wget-ssl/" \
+              openwrt/package/custom/luci-theme-argon/Makefile
+          fi
+
+          rm -rf \
+            openwrt/package/custom/luci-theme-argon/.git \
+            openwrt/package/custom/luci-app-argon-config/.git
+
+      - name: Add NetBird package
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          git clone \
+            --depth 1 \
+            https://github.com/ypj0202/netbird-openwrt-autobuild.git \
+            /tmp/netbird-openwrt-autobuild
+
+          if [[ ! -f /tmp/netbird-openwrt-autobuild/netbird/Makefile ]]; then
+            echo "NetBird OpenWrt package Makefile was not found."
+            exit 1
+          fi
+
+          cp -a \
+            /tmp/netbird-openwrt-autobuild/netbird \
+            openwrt/package/custom/netbird
+
+          rm -rf \
+            openwrt/package/custom/netbird/.git \
+            /tmp/netbird-openwrt-autobuild
+
+      - name: Install OpenWrt feeds
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          ./scripts/feeds install -a
+
+      - name: Verify custom package definitions
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          test -f openwrt/package/custom/luci-theme-argon/Makefile
+          test -f openwrt/package/custom/luci-app-argon-config/Makefile
+          test -f openwrt/package/custom/netbird/Makefile
+
+          echo "Custom package definitions:"
+          find openwrt/package/custom \
+            -maxdepth 2 \
+            -name Makefile \
+            -print
+
+      - name: Generate OpenWrt configuration
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cat > .config <<EOF
+          CONFIG_TARGET_ramips=y
+          CONFIG_TARGET_ramips_mt7621=y
+          CONFIG_TARGET_ramips_mt7621_DEVICE_${{ matrix.profile }}=y
+
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-ssl=y
+          CONFIG_PACKAGE_luci-app-firewall=y
+          CONFIG_PACKAGE_luci-app-opkg=y
+
+          CONFIG_PACKAGE_luci-theme-argon=y
+          CONFIG_PACKAGE_luci-app-argon-config=y
+
+          CONFIG_PACKAGE_netbird=y
+          CONFIG_PACKAGE_kmod-tun=y
+          CONFIG_PACKAGE_kmod-wireguard=y
+          CONFIG_PACKAGE_wireguard-tools=y
+
+          CONFIG_PACKAGE_ca-bundle=y
+          CONFIG_PACKAGE_ca-certificates=y
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_wget-ssl=y
+
+          CONFIG_DEVEL=y
+          CONFIG_CCACHE=y
+          EOF
+
+          make defconfig
+
+      - name: Verify final configuration
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          REQUIRED_OPTIONS=(
+            "CONFIG_TARGET_ramips=y"
+            "CONFIG_TARGET_ramips_mt7621=y"
+            "CONFIG_TARGET_ramips_mt7621_DEVICE_${{ matrix.profile }}=y"
+            "CONFIG_PACKAGE_luci-theme-argon=y"
+            "CONFIG_PACKAGE_luci-app-argon-config=y"
+            "CONFIG_PACKAGE_netbird=y"
+          )
+
+          for option in "${REQUIRED_OPTIONS[@]}"; do
+            if ! grep -Fqx "$option" .config; then
+              echo "Required configuration option is missing:"
+              echo "$option"
+              exit 1
+            fi
+          done
+
+          echo "Selected device:"
+          grep -E \
+            "^CONFIG_TARGET_ramips_mt7621_DEVICE_.*=y$" \
+            .config
+
+          echo "Selected custom packages:"
+          grep -E \
+            "^CONFIG_PACKAGE_(luci-theme-argon|luci-app-argon-config|netbird)=y$" \
+            .config
+
+      - name: Download source packages
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          make download -j"$(nproc)" V=s
+
+          # Remove incomplete or failed downloads.
+          find dl \
+            -type f \
+            -size -1024c \
+            -print \
+            -delete || true
+
+      - name: Build firmware
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -o pipefail
+
+          BUILD_JOBS="$(nproc)"
+
+          echo "Starting build with ${BUILD_JOBS} parallel jobs."
+
+          if ! make -j"${BUILD_JOBS}" V=s 2>&1 | tee build.log; then
+            echo "Parallel build failed."
+            echo "Retrying with one build job for clearer diagnostics."
+
+            make -j1 V=sc 2>&1 | tee -a build.log
+          fi
+
+      - name: Locate generated manifest
+        id: manifest
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          TARGET_DIRECTORY="bin/targets/ramips/mt7621"
+
+          echo "Generated target files:"
+          find "$TARGET_DIRECTORY" \
+            -maxdepth 1 \
+            -type f \
+            -printf "%f\n" \
+            | sort
+
+          MANIFEST_PATH="$(
+            find "$TARGET_DIRECTORY" \
+              -maxdepth 1 \
+              -type f \
+              -name "*${{ matrix.firmware_pattern }}*.manifest" \
+              -print \
+              | head -n 1
+          )"
+
+          if [[ -z "$MANIFEST_PATH" ]]; then
+            echo "No manifest found for ${{ matrix.device_name }}."
+            exit 1
+          fi
+
+          echo "manifest_path=$MANIFEST_PATH" >> "$GITHUB_OUTPUT"
+          echo "Found manifest: $MANIFEST_PATH"
+
+      - name: Verify packages are inside firmware
+        working-directory: openwrt
+        shell: bash
+        env:
+          MANIFEST_PATH: ${{ steps.manifest.outputs.manifest_path }}
+        run: |
+          set -euxo pipefail
+
+          echo "Checking firmware manifest:"
+          cat "$MANIFEST_PATH"
+
+          REQUIRED_PACKAGES=(
+            "luci-theme-argon"
+            "luci-app-argon-config"
+            "netbird"
+          )
+
+          for package in "${REQUIRED_PACKAGES[@]}"; do
+            if ! grep -Eq "^${package}[[:space:]]" "$MANIFEST_PATH"; then
+              echo "Required package is missing from firmware:"
+              echo "$package"
+              exit 1
+            fi
+          done
+
+          echo "All required packages are included."
+
+      - name: Collect firmware files
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          SOURCE_DIRECTORY="openwrt/bin/targets/ramips/mt7621"
+          OUTPUT_DIRECTORY="out/${{ matrix.artifact_name }}"
+
+          mkdir -p "$OUTPUT_DIRECTORY"
+
+          # Collect only files belonging to this device.
+          find "$SOURCE_DIRECTORY" \
+            -maxdepth 1 \
+            -type f \
+            \( \
+              -name "*${{ matrix.firmware_pattern }}*.bin" -o \
+              -name "*${{ matrix.firmware_pattern }}*.itb" -o \
+              -name "*${{ matrix.firmware_pattern }}*.manifest" \
+            \) \
+            -exec cp -v {} "$OUTPUT_DIRECTORY/" \;
+
+          # Collect common build metadata.
+          for metadata_file in \
+            config.buildinfo \
+            feeds.buildinfo \
+            version.buildinfo \
+            sha256sums; do
+            if [[ -f "$SOURCE_DIRECTORY/$metadata_file" ]]; then
+              cp -v \
+                "$SOURCE_DIRECTORY/$metadata_file" \
+                "$OUTPUT_DIRECTORY/${{ matrix.artifact_name }}-${metadata_file}"
+            fi
+          done
+
+          cp \
+            openwrt/.config \
+            "$OUTPUT_DIRECTORY/${{ matrix.artifact_name }}-build.config"
+
+          cp \
+            openwrt/build.log \
+            "$OUTPUT_DIRECTORY/${{ matrix.artifact_name }}-build.log"
+
+          echo "Collected files:"
+          find "$OUTPUT_DIRECTORY" \
+            -maxdepth 1 \
+            -type f \
+            -printf "%f\n" \
+            | sort
+
+          FIRMWARE_FILE="$(
+            find "$OUTPUT_DIRECTORY" \
+              -maxdepth 1 \
+              -type f \
+              \( -name "*.bin" -o -name "*.itb" \) \
+              -print \
+              | head -n 1
+          )"
+
+          if [[ -z "$FIRMWARE_FILE" ]]; then
+            echo "No firmware image was collected."
+            exit 1
+          fi
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.artifact_name }}
+          path: out/${{ matrix.artifact_name }}/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  release:
+    name: Publish monthly release
+    runs-on: ubuntu-24.04
+    needs: build
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download firmware artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: firmware-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: List release files
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          find release-assets \
+            -maxdepth 1 \
+            -type f \
+            -printf "%f\n" \
+            | sort
+
+          FIRMWARE_COUNT="$(
+            find release-assets \
+              -maxdepth 1 \
+              -type f \
+              \( -name "*.bin" -o -name "*.itb" \) \
+              | wc -l
+          )"
+
+          if [[ "$FIRMWARE_COUNT" -lt 2 ]]; then
+            echo "Expected firmware for two devices."
+            echo "Found only ${FIRMWARE_COUNT} firmware image files."
+            exit 1
+          fi
+
+      - name: Generate release information
+        id: release
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          RELEASE_TAG="monthly-$(date -u +'%Y-%m')"
+
+          echo "tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+
+          cat > release-notes.md <<EOF
+          Automated OpenWrt ${OPENWRT_VERSION} firmware build.
+
+          Included custom packages:
+
+          - luci-theme-argon
+          - luci-app-argon-config
+          - netbird
+
+          Devices:
+
+          - Xiaomi Mi Router CR6608
+          - Xiaomi Redmi Router AC2100
+
+          The build manifests are included in the release and can be used to
+          verify that the custom packages are present in each firmware image.
+          EOF
+
+      - name: Delete existing monthly release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euxo pipefail
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release delete \
+              "$RELEASE_TAG" \
+              --yes \
+              --cleanup-tag
+          fi
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          name: OpenWrt monthly build ${{ steps.release.outputs.tag }}
+          body_path: release-notes.md
+          files: |
+            release-assets/*.bin
+            release-assets/*.itb
+            release-assets/*.manifest
+            release-assets/*.buildinfo
+            release-assets/*.config
+          fail_on_unmatched_files: false
+          generate_release_notes: false
+          make_latest: true
