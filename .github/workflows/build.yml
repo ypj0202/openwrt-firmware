@@ -2,6 +2,12 @@ name: Monthly OpenWrt Firmware Build
 
 on:
   workflow_dispatch:
+    inputs:
+      force_build:
+        description: Build even when this OpenWrt version already has a release
+        required: false
+        default: false
+        type: boolean
   schedule:
     # First day of every month at 00:00 UTC
     - cron: "0 0 1 * *"
@@ -9,66 +15,61 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: openwrt-stable-firmware-build
+  cancel-in-progress: false
+
 jobs:
   detect-version:
-    name: Detect latest stable OpenWrt
+    name: Check for a new stable OpenWrt version
     runs-on: ubuntu-24.04
 
     outputs:
-      version: ${{ steps.openwrt.outputs.version }}
-      tag: ${{ steps.openwrt.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      should_build: ${{ steps.check.outputs.should_build }}
 
     steps:
-      - name: Resolve latest stable release
-        id: openwrt
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve latest stable OpenWrt release
+        id: version
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          RELEASES="$(
+          # The OpenWrt download index is the authoritative list of published
+          # stable releases. Ignore release candidates and sort numerically.
+          VERSION="$({
             curl \
               --fail \
               --silent \
               --show-error \
               --location \
               --retry 5 \
-              --header "Accept: application/vnd.github+json" \
-              --header "Authorization: Bearer ${GH_TOKEN}" \
-              --header "X-GitHub-Api-Version: 2022-11-28" \
-              "https://api.github.com/repos/openwrt/openwrt/releases?per_page=100"
-          )"
+              https://downloads.openwrt.org/releases/ \
+            | grep -oE 'href="[0-9]+\.[0-9]+\.[0-9]+/' \
+            | sed -E 's/^href="//; s:/$::' \
+            | sort -V \
+            | tail -n 1
+          })"
 
-          VERSION="$(
-            printf '%s' "${RELEASES}" |
-              python3 -c '
-          import json
-          import re
-          import sys
-
-          releases = json.load(sys.stdin)
-          versions = []
-
-          for release in releases:
-              if release.get("draft") or release.get("prerelease"):
-                  continue
-
-              tag = release.get("tag_name", "")
-              match = re.fullmatch(r"v?(\d+\.\d+\.\d+)", tag)
-
-              if match:
-                  version = match.group(1)
-                  versions.append(tuple(map(int, version.split("."))))
-
-          if not versions:
-              raise SystemExit("No stable OpenWrt x.y.z release was found")
-
-          print(".".join(map(str, max(versions))))
-          '
-          )"
+          if [[ -z "${VERSION}" ]]; then
+            echo "Could not determine the latest stable OpenWrt version."
+            exit 1
+          fi
 
           TAG="v${VERSION}"
+
+          # Confirm that the matching source tag exists before continuing.
+          git ls-remote \
+            --exit-code \
+            --refs \
+            https://github.com/openwrt/openwrt.git \
+            "refs/tags/${TAG}" >/dev/null
 
           echo "Latest stable OpenWrt version: ${VERSION}"
           echo "OpenWrt source tag: ${TAG}"
@@ -76,22 +77,50 @@ jobs:
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
 
-      - name: Verify source tag exists
+      - name: Check whether this version was already released
+        id: check
         shell: bash
         env:
-          OPENWRT_TAG: ${{ steps.openwrt.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          FORCE_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.force_build || false }}
         run: |
           set -euo pipefail
 
-          git ls-remote \
-            --exit-code \
-            --refs \
-            https://github.com/openwrt/openwrt.git \
-            "refs/tags/${OPENWRT_TAG}"
+          if [[ "${FORCE_BUILD}" == "true" ]]; then
+            echo "A forced manual build was requested."
+            echo "should_build=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if gh release view "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release ${RELEASE_TAG} already exists. No new OpenWrt version was found."
+            echo "should_build=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "Release ${RELEASE_TAG} does not exist. A new build is required."
+            echo "should_build=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Add job summary
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          SHOULD_BUILD: ${{ steps.check.outputs.should_build }}
+        run: |
+          {
+            echo "## OpenWrt version check"
+            echo
+            echo "- Latest stable version: **${VERSION}**"
+            echo "- Release tag: **${TAG}**"
+            echo "- Build required: **${SHOULD_BUILD}**"
+          } >> "${GITHUB_STEP_SUMMARY}"
 
   build:
     name: Build ${{ matrix.device_name }}
     needs: detect-version
+    if: needs.detect-version.outputs.should_build == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 360
 
@@ -104,18 +133,22 @@ jobs:
       matrix:
         include:
           - device_name: Xiaomi Mi Router CR6608
+            target: ramips
+            subtarget: mt7621
             profile: xiaomi_mi-router-cr6608
             firmware_pattern: xiaomi_mi-router-cr6608
             artifact_name: xiaomi-mi-router-cr6608
 
           - device_name: Xiaomi Redmi Router AC2100
+            target: ramips
+            subtarget: mt7621
             profile: xiaomi_redmi-router-ac2100
             firmware_pattern: xiaomi_redmi-router-ac2100
             artifact_name: xiaomi-redmi-router-ac2100
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Free disk space
         shell: bash
@@ -300,17 +333,30 @@ jobs:
       - name: Verify device profile exists
         working-directory: openwrt
         shell: bash
+        env:
+          PROFILE: ${{ matrix.profile }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
 
-          PROFILE_SYMBOL="TARGET_ramips_mt7621_DEVICE_${{ matrix.profile }}"
-
-          if ! grep -Rqs \
-            "config ${PROFILE_SYMBOL}" \
-            target/linux/ramips/image; then
-            echo "Device profile not found: ${PROFILE_SYMBOL}"
+          # OpenWrt image Makefiles define profiles as:
+          #   define Device/<profile>
+          # They do not define them as Kconfig "config TARGET_..." entries.
+          if ! grep -RqsE \
+            "^[[:space:]]*define[[:space:]]+Device/${PROFILE}[[:space:]]*$" \
+            "target/linux/${TARGET}/image"; then
+            echo "Device definition not found: Device/${PROFILE}"
+            echo "Similar Xiaomi device definitions available in this source tree:"
+            grep -RhsE \
+              '^[[:space:]]*define[[:space:]]+Device/xiaomi_' \
+              "target/linux/${TARGET}/image" \
+              | sed -E 's/^[[:space:]]*define[[:space:]]+Device\///' \
+              | sort -u \
+              || true
             exit 1
           fi
+
+          echo "Found OpenWrt device definition: Device/${PROFILE}"
 
       - name: Generate OpenWrt configuration
         working-directory: openwrt
@@ -319,9 +365,9 @@ jobs:
           set -euo pipefail
 
           cat > .config <<EOF
-          CONFIG_TARGET_ramips=y
-          CONFIG_TARGET_ramips_mt7621=y
-          CONFIG_TARGET_ramips_mt7621_DEVICE_${{ matrix.profile }}=y
+          CONFIG_TARGET_${{ matrix.target }}=y
+          CONFIG_TARGET_${{ matrix.target }}_${{ matrix.subtarget }}=y
+          CONFIG_TARGET_${{ matrix.target }}_${{ matrix.subtarget }}_DEVICE_${{ matrix.profile }}=y
 
           CONFIG_PACKAGE_luci=y
           CONFIG_PACKAGE_luci-ssl=y
@@ -351,9 +397,9 @@ jobs:
           set -euo pipefail
 
           REQUIRED_OPTIONS=(
-            "CONFIG_TARGET_ramips=y"
-            "CONFIG_TARGET_ramips_mt7621=y"
-            "CONFIG_TARGET_ramips_mt7621_DEVICE_${{ matrix.profile }}=y"
+            "CONFIG_TARGET_${{ matrix.target }}=y"
+            "CONFIG_TARGET_${{ matrix.target }}_${{ matrix.subtarget }}=y"
+            "CONFIG_TARGET_${{ matrix.target }}_${{ matrix.subtarget }}_DEVICE_${{ matrix.profile }}=y"
             "CONFIG_PACKAGE_luci-theme-argon=y"
             "CONFIG_PACKAGE_luci-app-argon-config=y"
             "CONFIG_PACKAGE_netbird=y"
@@ -361,13 +407,15 @@ jobs:
 
           for option in "${REQUIRED_OPTIONS[@]}"; do
             if ! grep -Fqx "${option}" .config; then
-              echo "Required configuration option is missing: ${option}"
+              echo "Required configuration option is missing after make defconfig: ${option}"
+              echo "Selected device options:"
+              grep -E '^CONFIG_TARGET_.*_DEVICE_.*=y$' .config || true
               exit 1
             fi
           done
 
           grep -E \
-            '^CONFIG_TARGET_ramips_mt7621_DEVICE_.*=y$|^CONFIG_PACKAGE_(luci-theme-argon|luci-app-argon-config|netbird)=y$' \
+            '^CONFIG_TARGET_.*_DEVICE_.*=y$|^CONFIG_PACKAGE_(luci-theme-argon|luci-app-argon-config|netbird)=y$' \
             .config
 
       - name: Download package sources
@@ -378,7 +426,7 @@ jobs:
 
           make download -j"$(nproc)" V=s
 
-          # Delete suspiciously small/incomplete downloads.
+          # Delete suspiciously small or incomplete downloads.
           find dl -type f -size -1024c -print -delete || true
 
       - name: Build firmware
@@ -401,7 +449,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          TARGET_DIR="bin/targets/ramips/mt7621"
+          TARGET_DIR="bin/targets/${{ matrix.target }}/${{ matrix.subtarget }}"
 
           echo "Generated target files:"
           find "${TARGET_DIR}" \
@@ -410,14 +458,14 @@ jobs:
             -printf '%f\n' \
             | sort
 
-          MANIFEST="$(
+          MANIFEST="$({
             find "${TARGET_DIR}" \
               -maxdepth 1 \
               -type f \
               -name "*${{ matrix.firmware_pattern }}*.manifest" \
               -print \
               | head -n 1
-          )"
+          })"
 
           if [[ -z "${MANIFEST}" ]]; then
             echo "No manifest found for ${{ matrix.device_name }}."
@@ -444,7 +492,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          SOURCE_DIR="openwrt/bin/targets/ramips/mt7621"
+          SOURCE_DIR="openwrt/bin/targets/${{ matrix.target }}/${{ matrix.subtarget }}"
           OUTPUT_DIR="out/${{ matrix.artifact_name }}"
 
           mkdir -p "${OUTPUT_DIR}"
@@ -491,14 +539,14 @@ jobs:
             -type f \
             \( -name '*.bin' -o -name '*.itb' \) \
             -print \
-            -quit |
-            grep -q .; then
+            -quit \
+            | grep -q .; then
             echo "No firmware image was collected."
             exit 1
           fi
 
       - name: Upload firmware artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: firmware-${{ matrix.artifact_name }}
           path: out/${{ matrix.artifact_name }}/
@@ -507,10 +555,11 @@ jobs:
           compression-level: 0
 
   release:
-    name: Publish monthly release
+    name: Publish OpenWrt ${{ needs.detect-version.outputs.tag }}
     needs:
       - detect-version
       - build
+    if: needs.detect-version.outputs.should_build == 'true' && needs.build.result == 'success'
     runs-on: ubuntu-24.04
 
     env:
@@ -519,7 +568,7 @@ jobs:
 
     steps:
       - name: Download firmware artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v4
         with:
           pattern: firmware-*
           path: release-assets
@@ -537,13 +586,13 @@ jobs:
             -printf '%f\n' \
             | sort
 
-          FIRMWARE_COUNT="$(
+          FIRMWARE_COUNT="$({
             find release-assets \
               -maxdepth 1 \
               -type f \
               \( -name '*.bin' -o -name '*.itb' \) \
               | wc -l
-          )"
+          })"
 
           if [[ "${FIRMWARE_COUNT}" -lt 2 ]]; then
             echo "Expected firmware images for both devices."
@@ -551,59 +600,13 @@ jobs:
             exit 1
           fi
 
-      - name: Generate release information
-        id: release
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          RELEASE_TAG="monthly-$(date -u +'%Y-%m')"
-
-          echo "tag=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
-
-          cat > release-notes.md <<EOF
-          Automated OpenWrt ${OPENWRT_VERSION} firmware build.
-
-          OpenWrt source tag:
-
-          - ${OPENWRT_TAG}
-
-          Included custom packages:
-
-          - luci-theme-argon
-          - luci-app-argon-config
-          - netbird
-
-          Devices:
-
-          - Xiaomi Mi Router CR6608
-          - Xiaomi Redmi Router AC2100
-
-          Each device manifest is included so the embedded packages can be verified.
-          EOF
-
-      - name: Delete existing release for this month
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-        run: |
-          set -euo pipefail
-
-          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            gh release delete \
-              "${RELEASE_TAG}" \
-              --yes \
-              --cleanup-tag
-          fi
-
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@v2
         with:
           token: ${{ github.token }}
-          tag_name: ${{ steps.release.outputs.tag }}
-          name: OpenWrt monthly build ${{ steps.release.outputs.tag }}
-          body_path: release-notes.md
+          tag_name: ${{ env.OPENWRT_TAG }}
+          name: ${{ env.OPENWRT_TAG }}
+          body: ""
           files: |
             release-assets/*.bin
             release-assets/*.itb
