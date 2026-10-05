@@ -429,6 +429,16 @@ jobs:
           # Delete suspiciously small or incomplete downloads.
           find dl -type f -size -1024c -print -delete || true
 
+      - name: Preserve NetBird identity during future upgrades
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p openwrt/files/lib/upgrade/keep.d
+
+          printf '%s\n' '/root/.config/netbird/' \
+            > openwrt/files/lib/upgrade/keep.d/netbird
+
       - name: Build firmware
         working-directory: openwrt
         shell: bash
