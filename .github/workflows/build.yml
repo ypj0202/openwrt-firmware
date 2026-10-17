@@ -77,7 +77,7 @@ jobs:
           BRANCH="openwrt-${SERIES}"
           BUILD_DATE="$(TZ="${BUILD_TIMEZONE}" date +%Y%m%d)"
           TAG="v${VERSION}-build-${BUILD_DATE}"
-          FIRMWARE_VERSION="${VERSION} build ${BUILD_DATE}"
+          FIRMWARE_VERSION="${VERSION}-${BUILD_DATE}"
           SOURCE_COMMIT="$(git ls-remote --exit-code --heads \
             https://github.com/openwrt/openwrt.git "refs/heads/${BRANCH}" | awk '{print $1}')"
           [[ "${SOURCE_COMMIT}" =~ ^[0-9a-f]{40}$ ]]
