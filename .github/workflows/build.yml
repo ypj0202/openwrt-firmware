@@ -19,20 +19,19 @@ concurrency:
   group: openwrt-stable-firmware-build
   cancel-in-progress: false
 
-# CHANGED: Local date used in release names and the LuCI firmware version.
+
 env:
   BUILD_TIMEZONE: Europe/Amsterdam
 
 jobs:
   detect-version:
-    name: Resolve stable branch and dated build
+    name: Resolve release tag and dated build
     runs-on: ubuntu-24.04
 
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
       should_build: ${{ steps.check.outputs.should_build }}
-      # CHANGED: One source commit and date shared by both device builds.
       branch: ${{ steps.version.outputs.branch }}
       source_commit: ${{ steps.version.outputs.source_commit }}
       firmware_version: ${{ steps.version.outputs.firmware_version }}
@@ -71,26 +70,25 @@ jobs:
             exit 1
           fi
 
-          # CHANGED: Separate upstream tag, stable branch, release tag and UI version.
+          
           SOURCE_TAG="v${VERSION}"
           SERIES="${VERSION%.*}"
           BRANCH="openwrt-${SERIES}"
           BUILD_DATE="$(TZ="${BUILD_TIMEZONE}" date +%Y%m%d)"
           TAG="v${VERSION}-build-${BUILD_DATE}"
-          FIRMWARE_VERSION="${VERSION}-${BUILD_DATE}"
-          SOURCE_COMMIT="$(git ls-remote --exit-code --heads \
-            https://github.com/openwrt/openwrt.git "refs/heads/${BRANCH}" | awk '{print $1}')"
-          [[ "${SOURCE_COMMIT}" =~ ^[0-9a-f]{40}$ ]]
-
-          # Confirm that the matching source tag exists before continuing.
-          git ls-remote \
-            --exit-code \
-            --refs \
+          TAG_REFS="$(git ls-remote --exit-code --tags \
             https://github.com/openwrt/openwrt.git \
-            "refs/tags/${SOURCE_TAG}" >/dev/null
+            "refs/tags/${SOURCE_TAG}" "refs/tags/${SOURCE_TAG}^{}")"
+          SOURCE_COMMIT="$(printf '%s\n' "${TAG_REFS}" | awk '
+            $2 ~ /\^\{\}$/ { peeled = $1 }
+            $2 !~ /\^\{\}$/ { direct = $1 }
+            END { print (peeled != "" ? peeled : direct) }
+          ')"
+          [[ "${SOURCE_COMMIT}" =~ ^[0-9a-f]{40}$ ]]
+          FIRMWARE_VERSION="${VERSION}-${BUILD_DATE}~${SOURCE_COMMIT:0:7}"
 
           echo "Latest stable OpenWrt version: ${VERSION}"
-          echo "OpenWrt stable branch: ${BRANCH} (${SOURCE_COMMIT})"
+          echo "OpenWrt source tag: ${SOURCE_TAG} (${SOURCE_COMMIT}); package feeds: ${BRANCH}"
           echo "GitHub release: ${TAG}"
           echo "Firmware version: ${FIRMWARE_VERSION}"
           echo "branch=${BRANCH}" >> "${GITHUB_OUTPUT}"
@@ -273,22 +271,39 @@ jobs:
         run: |
           set -euo pipefail
 
-          # CHANGED: Build current stable-branch code, not the frozen release tag.
-          # Fetch the resolved commit so both routers use the same core source.
-          git init openwrt
-          git -C openwrt remote add origin https://github.com/openwrt/openwrt.git
-          git -C openwrt fetch --depth 1 origin "${OPENWRT_SOURCE_COMMIT}"
-          git -C openwrt checkout --detach FETCH_HEAD
+          
+          git clone --depth 1 --branch "v${OPENWRT_VERSION}" \
+            https://github.com/openwrt/openwrt.git openwrt
           test "$(git -C openwrt rev-parse HEAD)" = "${OPENWRT_SOURCE_COMMIT}"
-          echo "Building ${OPENWRT_BRANCH} at ${OPENWRT_SOURCE_COMMIT}"
+          echo "Building release tag v${OPENWRT_VERSION} at ${OPENWRT_SOURCE_COMMIT}"
+
+
+      - name: Customize firmware description
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYVERSION'
+          from pathlib import Path
+          changes = {
+              "package/base-files/files/etc/openwrt_release": (
+                  "DISTRIB_DESCRIPTION='%D %V %C'", "DISTRIB_DESCRIPTION='%D %V'"),
+              "package/base-files/files/usr/lib/os-release": (
+                  'OPENWRT_RELEASE="%D %V %C"', 'OPENWRT_RELEASE="%D %V"'),
+          }
+          for filename, (old, new) in changes.items():
+              path = Path(filename)
+              content = path.read_text()
+              if content.count(old) != 1:
+                  raise SystemExit(f"Unexpected version template in {filename}")
+              path.write_text(content.replace(old, new))
+          PYVERSION
 
       - name: Update OpenWrt feeds
         working-directory: openwrt
         shell: bash
         run: |
           set -euo pipefail
-          # CHANGED: Track matching stable branches for the standard feeds.
-          # Replace any release-time commit pins; leave other feeds untouched.
           python3 - <<'PYFEEDS'
           import os
           from pathlib import Path
@@ -319,7 +334,8 @@ jobs:
             https://github.com/sbwml/packages_lang_golang.git \
             feeds/packages/lang/golang
 
-      - name: Add Argon packages
+
+      - name: Add Argon theme
         shell: bash
         run: |
           set -euo pipefail
@@ -331,11 +347,6 @@ jobs:
             https://github.com/jerrykuku/luci-theme-argon.git \
             openwrt/package/custom/luci-theme-argon
 
-          git clone \
-            --depth 1 \
-            https://github.com/jerrykuku/luci-app-argon-config.git \
-            openwrt/package/custom/luci-app-argon-config
-
           THEME_MAKEFILE="openwrt/package/custom/luci-theme-argon/Makefile"
 
           if grep -q 'LUCI_DEPENDS:=+wget' "${THEME_MAKEFILE}"; then
@@ -344,9 +355,7 @@ jobs:
               "${THEME_MAKEFILE}"
           fi
 
-          rm -rf \
-            openwrt/package/custom/luci-theme-argon/.git \
-            openwrt/package/custom/luci-app-argon-config/.git
+          rm -rf openwrt/package/custom/luci-theme-argon/.git
 
       - name: Add NetBird package
         shell: bash
@@ -418,7 +427,6 @@ jobs:
           CONFIG_PACKAGE_luci-ssl=y
 
           CONFIG_PACKAGE_luci-theme-argon=y
-          CONFIG_PACKAGE_luci-app-argon-config=y
 
           CONFIG_PACKAGE_netbird=y
           CONFIG_PACKAGE_kmod-tun=y
@@ -430,15 +438,13 @@ jobs:
           CONFIG_PACKAGE_curl=y
           CONFIG_PACKAGE_wget-ssl=y
 
-          # CHANGED: Custom firmware version; preserve the automatic Git revision.
-          # FIX: Enable image options so defconfig retains version overrides.
+          
           CONFIG_IMAGEOPT=y
           CONFIG_VERSIONOPT=y
           CONFIG_VERSION_DIST="OpenWrt"
           CONFIG_VERSION_NUMBER="${FIRMWARE_VERSION}"
           CONFIG_VERSION_CODE=""
-          # Use the stable snapshot feed URL, never the custom display version.
-          CONFIG_VERSION_REPO="https://downloads.openwrt.org/releases/${OPENWRT_SERIES}-SNAPSHOT"
+          CONFIG_VERSION_REPO="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}"
 
           CONFIG_CCACHE=y
           EOF
@@ -455,12 +461,11 @@ jobs:
             'CONFIG_IMAGEOPT=y'
             'CONFIG_VERSIONOPT=y'
             "CONFIG_VERSION_NUMBER=\"${FIRMWARE_VERSION}\""
-            "CONFIG_VERSION_REPO=\"https://downloads.openwrt.org/releases/${OPENWRT_SERIES}-SNAPSHOT\""
+            "CONFIG_VERSION_REPO=\"https://downloads.openwrt.org/releases/${OPENWRT_VERSION}\""
             "CONFIG_TARGET_${{ matrix.target }}=y"
             "CONFIG_TARGET_${{ matrix.target }}_${{ matrix.subtarget }}=y"
             "CONFIG_TARGET_${{ matrix.target }}_${{ matrix.subtarget }}_DEVICE_${{ matrix.profile }}=y"
             "CONFIG_PACKAGE_luci-theme-argon=y"
-            "CONFIG_PACKAGE_luci-app-argon-config=y"
             "CONFIG_PACKAGE_netbird=y"
           )
 
@@ -474,7 +479,7 @@ jobs:
           done
 
           grep -E \
-            '^CONFIG_TARGET_.*_DEVICE_.*=y$|^CONFIG_PACKAGE_(luci-theme-argon|luci-app-argon-config|netbird)=y$' \
+            '^CONFIG_TARGET_.*_DEVICE_.*=y$|^CONFIG_PACKAGE_(luci-theme-argon|netbird)=y$' \
             .config
 
       - name: Download package sources
@@ -543,7 +548,6 @@ jobs:
 
           REQUIRED_PACKAGES=(
             "luci-theme-argon"
-            "luci-app-argon-config"
             "netbird"
           )
 
@@ -679,9 +683,23 @@ jobs:
           files: |
             release-assets/*.bin
             release-assets/*.itb
-            release-assets/*.manifest
-            release-assets/*.buildinfo
-            release-assets/*.config
           fail_on_unmatched_files: false
           generate_release_notes: false
           make_latest: true
+
+      - name: Remove metadata assets from release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ASSETS="$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --json assets --jq '.assets[].name')"
+          while IFS= read -r asset; do
+            case "${asset}" in
+              *.manifest|*.buildinfo|*.config)
+                gh release delete-asset "${RELEASE_TAG}" "${asset}" \
+                  --repo "${GITHUB_REPOSITORY}" --yes
+                ;;
+            esac
+          done <<< "${ASSETS}"
