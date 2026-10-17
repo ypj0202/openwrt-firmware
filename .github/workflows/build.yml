@@ -431,6 +431,8 @@ jobs:
           CONFIG_PACKAGE_wget-ssl=y
 
           # CHANGED: Custom firmware version; preserve the automatic Git revision.
+          # FIX: Enable image options so defconfig retains version overrides.
+          CONFIG_IMAGEOPT=y
           CONFIG_VERSIONOPT=y
           CONFIG_VERSION_DIST="OpenWrt"
           CONFIG_VERSION_NUMBER="${FIRMWARE_VERSION}"
@@ -450,6 +452,7 @@ jobs:
           set -euo pipefail
 
           REQUIRED_OPTIONS=(
+            'CONFIG_IMAGEOPT=y'
             'CONFIG_VERSIONOPT=y'
             "CONFIG_VERSION_NUMBER=\"${FIRMWARE_VERSION}\""
             "CONFIG_VERSION_REPO=\"https://downloads.openwrt.org/releases/${OPENWRT_SERIES}-SNAPSHOT\""
