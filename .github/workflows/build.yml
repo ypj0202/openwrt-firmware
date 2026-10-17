@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       force_build:
-        description: Build even when this OpenWrt version already has a release
+        description: Rebuild and replace assets even when today's dated release exists
         required: false
         default: false
         type: boolean
@@ -19,15 +19,25 @@ concurrency:
   group: openwrt-stable-firmware-build
   cancel-in-progress: false
 
+# CHANGED: Custom revision used in LuCI, e.g. 25.12.5-2-261017.
+env:
+  CUSTOM_REVISION: "2"
+  BUILD_TIMEZONE: Europe/Amsterdam
+
 jobs:
   detect-version:
-    name: Check for a new stable OpenWrt version
+    name: Resolve stable branch and dated build
     runs-on: ubuntu-24.04
 
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
       should_build: ${{ steps.check.outputs.should_build }}
+      # CHANGED: One source commit and date shared by both device builds.
+      branch: ${{ steps.version.outputs.branch }}
+      source_commit: ${{ steps.version.outputs.source_commit }}
+      firmware_version: ${{ steps.version.outputs.firmware_version }}
+      series: ${{ steps.version.outputs.series }}
 
     steps:
       - name: Checkout repository
@@ -62,22 +72,37 @@ jobs:
             exit 1
           fi
 
-          TAG="v${VERSION}"
+          # CHANGED: Separate upstream tag, stable branch, release tag and UI version.
+          SOURCE_TAG="v${VERSION}"
+          SERIES="${VERSION%.*}"
+          BRANCH="openwrt-${SERIES}"
+          BUILD_DATE="$(TZ="${BUILD_TIMEZONE}" date +%Y%m%d)"
+          TAG="v${VERSION}-build-${BUILD_DATE}"
+          FIRMWARE_VERSION="${VERSION}-${CUSTOM_REVISION}-${BUILD_DATE:2}"
+          SOURCE_COMMIT="$(git ls-remote --exit-code --heads \
+            https://github.com/openwrt/openwrt.git "refs/heads/${BRANCH}" | awk '{print $1}')"
+          [[ "${SOURCE_COMMIT}" =~ ^[0-9a-f]{40}$ ]]
 
           # Confirm that the matching source tag exists before continuing.
           git ls-remote \
             --exit-code \
             --refs \
             https://github.com/openwrt/openwrt.git \
-            "refs/tags/${TAG}" >/dev/null
+            "refs/tags/${SOURCE_TAG}" >/dev/null
 
           echo "Latest stable OpenWrt version: ${VERSION}"
-          echo "OpenWrt source tag: ${TAG}"
+          echo "OpenWrt stable branch: ${BRANCH} (${SOURCE_COMMIT})"
+          echo "GitHub release: ${TAG}"
+          echo "Firmware version: ${FIRMWARE_VERSION}"
+          echo "branch=${BRANCH}" >> "${GITHUB_OUTPUT}"
+          echo "series=${SERIES}" >> "${GITHUB_OUTPUT}"
+          echo "source_commit=${SOURCE_COMMIT}" >> "${GITHUB_OUTPUT}"
+          echo "firmware_version=${FIRMWARE_VERSION}" >> "${GITHUB_OUTPUT}"
 
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
 
-      - name: Check whether this version was already released
+      - name: Check whether today's dated build was already released
         id: check
         shell: bash
         env:
@@ -95,7 +120,7 @@ jobs:
 
           if gh release view "${RELEASE_TAG}" \
             --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            echo "Release ${RELEASE_TAG} already exists. No new OpenWrt version was found."
+            echo "Release ${RELEASE_TAG} already exists. Today's build already exists; use force_build to replace its assets."
             echo "should_build=false" >> "${GITHUB_OUTPUT}"
           else
             echo "Release ${RELEASE_TAG} does not exist. A new build is required."
@@ -126,7 +151,11 @@ jobs:
 
     env:
       OPENWRT_VERSION: ${{ needs.detect-version.outputs.version }}
-      OPENWRT_TAG: ${{ needs.detect-version.outputs.tag }}
+      RELEASE_TAG: ${{ needs.detect-version.outputs.tag }}
+      OPENWRT_BRANCH: ${{ needs.detect-version.outputs.branch }}
+      OPENWRT_SOURCE_COMMIT: ${{ needs.detect-version.outputs.source_commit }}
+      OPENWRT_SERIES: ${{ needs.detect-version.outputs.series }}
+      FIRMWARE_VERSION: ${{ needs.detect-version.outputs.firmware_version }}
 
     strategy:
       fail-fast: false
@@ -245,19 +274,36 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Building OpenWrt ${OPENWRT_VERSION} from ${OPENWRT_TAG}"
-
-          git clone \
-            --depth 1 \
-            --branch "${OPENWRT_TAG}" \
-            https://github.com/openwrt/openwrt.git \
-            openwrt
+          # CHANGED: Build current stable-branch code, not the frozen release tag.
+          # Fetch the resolved commit so both routers use the same core source.
+          git init openwrt
+          git -C openwrt remote add origin https://github.com/openwrt/openwrt.git
+          git -C openwrt fetch --depth 1 origin "${OPENWRT_SOURCE_COMMIT}"
+          git -C openwrt checkout --detach FETCH_HEAD
+          test "$(git -C openwrt rev-parse HEAD)" = "${OPENWRT_SOURCE_COMMIT}"
+          echo "Building ${OPENWRT_BRANCH} at ${OPENWRT_SOURCE_COMMIT}"
 
       - name: Update OpenWrt feeds
         working-directory: openwrt
         shell: bash
         run: |
           set -euo pipefail
+          # CHANGED: Track matching stable branches for the standard feeds.
+          # Replace any release-time commit pins; leave other feeds untouched.
+          python3 - <<'PYFEEDS'
+          import os
+          from pathlib import Path
+          path = Path("feeds.conf.default")
+          lines = []
+          for line in path.read_text().splitlines():
+              parts = line.split()
+              if len(parts) >= 3 and parts[0] in ("src-git", "src-git-full") and parts[1] in ("packages", "luci", "routing", "telephony"):
+                  url = parts[2].split(";", 1)[0].split("^", 1)[0]
+                  parts[2] = url + ";" + os.environ["OPENWRT_BRANCH"]
+                  line = " ".join(parts)
+              lines.append(line)
+          Path("feeds.conf").write_text("\n".join(lines) + "\n")
+          PYFEEDS
           ./scripts/feeds update -a
 
       - name: Replace Go package feed for NetBird
@@ -385,6 +431,14 @@ jobs:
           CONFIG_PACKAGE_curl=y
           CONFIG_PACKAGE_wget-ssl=y
 
+          # CHANGED: Custom firmware version; preserve the automatic Git revision.
+          CONFIG_VERSIONOPT=y
+          CONFIG_VERSION_DIST="OpenWrt"
+          CONFIG_VERSION_NUMBER="${FIRMWARE_VERSION}"
+          CONFIG_VERSION_CODE=""
+          # Use the stable snapshot feed URL, never the custom display version.
+          CONFIG_VERSION_REPO="https://downloads.openwrt.org/releases/${OPENWRT_SERIES}-SNAPSHOT"
+
           CONFIG_CCACHE=y
           EOF
 
@@ -397,6 +451,9 @@ jobs:
           set -euo pipefail
 
           REQUIRED_OPTIONS=(
+            'CONFIG_VERSIONOPT=y'
+            "CONFIG_VERSION_NUMBER=\"${FIRMWARE_VERSION}\""
+            "CONFIG_VERSION_REPO=\"https://downloads.openwrt.org/releases/${OPENWRT_SERIES}-SNAPSHOT\""
             "CONFIG_TARGET_${{ matrix.target }}=y"
             "CONFIG_TARGET_${{ matrix.target }}_${{ matrix.subtarget }}=y"
             "CONFIG_TARGET_${{ matrix.target }}_${{ matrix.subtarget }}_DEVICE_${{ matrix.profile }}=y"
@@ -574,7 +631,7 @@ jobs:
 
     env:
       OPENWRT_VERSION: ${{ needs.detect-version.outputs.version }}
-      OPENWRT_TAG: ${{ needs.detect-version.outputs.tag }}
+      RELEASE_TAG: ${{ needs.detect-version.outputs.tag }}
 
     steps:
       - name: Download firmware artifacts
@@ -614,8 +671,8 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           token: ${{ github.token }}
-          tag_name: ${{ env.OPENWRT_TAG }}
-          name: ${{ env.OPENWRT_TAG }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
           body: ""
           files: |
             release-assets/*.bin
